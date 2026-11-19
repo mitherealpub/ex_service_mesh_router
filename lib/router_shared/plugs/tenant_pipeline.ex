@@ -11,20 +11,14 @@ defmodule Router.Shared.Plugs.TenantPipeline do
       |> get_req_header("host")
       |> List.first()
 
+      |> Kernel.||(conn.host)
+
     case TenantResolver.resolve(host) do
       {:ok, tenant} ->
         conn
-        # 1. Always assign tenant identifier to short-lived connection metadata
         |> assign(:tenant, tenant)
-
-        # 2. CRITICAL FIX FOR LIVEVIEW: Persist the tenant into the HTTP session 
-        # so that the stateful on_mount token checks can read it after the websocket upgrade.
-        |> put_session("tenant", tenant)
-
-        # 3. Conditionally apply Ecto routing side effects safely
+        |> maybe_put_session_tenant(tenant)
         |> maybe_put_ecto_tenant(tenant)
-
-        # 4. Conditionally apply Ash framework process context scopes safely
         |> maybe_put_ash_tenant(tenant)
 
       :error ->
@@ -42,48 +36,40 @@ defmodule Router.Shared.Plugs.TenantPipeline do
     end
   end
 
-  # --- Ecto Configuration Hook ---
-  defp maybe_put_ecto_tenant(conn, tenant) do
-    case Application.get_env(:router_shared, :enable_ecto_tenant, false) do
-      true ->
-        repo = Application.get_env(:router_shared, :ecto_repo)
+  # Only writes to the session if `:fetch_session` has already run (allows reuse in `:api` pipelines)
+  defp maybe_put_session_tenant(%{private: %{plug_session_fetch: :done}} = conn, tenant) do
+    put_session(conn, "tenant", tenant)
+  end
 
-        if repo do
-          # repo.put_tenant/1 modifies the process dictionary registry and returns an atom.
-          # We execute the side effect and explicitly return the conn map.
-          _ = repo.put_tenant(tenant)
-          conn
-        else
+  defp maybe_put_session_tenant(conn, _tenant), do: conn
+
+  defp maybe_put_ecto_tenant(conn, tenant) do
+    if Application.get_env(:router_shared, :enable_ecto_tenant, false) do
+      case Application.get_env(:router_shared, :ecto_repo) do
+        nil ->
           Logger.error(
             "[Tenant Isolation Engine] Configuration error: :enable_ecto_tenant is true but :ecto_repo is missing."
           )
 
-          conn
-        end
-
-      false ->
-        conn
+        repo ->
+          _ = repo.put_tenant(tenant)
+      end
     end
+
+    conn
   end
 
-  # --- Ash Framework Configuration Hook ---
   defp maybe_put_ash_tenant(conn, tenant) do
-    case Application.get_env(:router_shared, :enable_ash_tenant, false) do
-      true ->
-        if Code.ensure_loaded?(Ash) do
-          # We perform the state tracking assignment and return the conn chain cleanly.
-          _ = Ash.set_tenant(tenant)
-          conn
-        else
-          Logger.error(
-            "[Tenant Isolation Engine] Configuration error: :enable_ash_tenant is true but the Ash framework package is not loaded."
-          )
-
-          conn
-        end
-
-      false ->
-        conn
+    if Application.get_env(:router_shared, :enable_ash_tenant, false) do
+      if Code.ensure_loaded?(Ash) do
+        _ = Ash.set_tenant(tenant)
+      else
+        Logger.error(
+          "[Tenant Isolation Engine] Configuration error: :enable_ash_tenant is true but Ash is not loaded."
+        )
+      end
     end
+
+    conn
   end
 end

@@ -1,55 +1,60 @@
 defmodule Router.Shared.TenantResolver do
   @moduledoc """
-  Extracts the leftmost tenant identifier from an incoming host string.
-  Supports standard triple-dot paths and deep multi-part corporate or cloud TLD zones.
-  Includes advanced regular expression and wildcard safeguarding parameters to intercept root routing leaks.
+  Resolves incoming HTTP Host headers to a tenant identifier, supporting both
+  mapped custom domains (apex or subdomain) and standard tenant subdomains.
   """
 
   @spec resolve(String.t() | nil) :: {:ok, String.t()} | :error
   def resolve(nil), do: :error
 
-  def resolve(host) do
-    # Strip away any trailing connection port numbers
-    clean_host = host |> String.split(":") |> List.first()
+  def resolve(host_header) when is_binary(host_header) do
+    host =
+      host_header
+      |> String.split(":")
+      |> List.first()
+      |> String.downcase()
+      |> String.trim()
 
-    # Apply configuration safeguards prior to performing domain extraction splits
-    if safeguarded?(clean_host) do
-      :error
-    else
-      case String.split(clean_host, ".") do
-        # At least two remaining elements to form a valid service and domain suffix.
-        [tenant | rest] when length(rest) >= 2 ->
-          # Final validation step: ensure the extracted tenant token itself isn't a restricted pattern
-          validate_tenant_token(tenant)
+    cond do
+      host == "" ->
+        :error
 
-        # Safeguard against root routing access attempts (e.g., "auth.mesh.local")
-        _ ->
-          :error
-      end
+      ignored_host?(host) ->
+        :error
+
+      true ->
+        case resolve_custom_domain(host) do
+          {:ok, tenant} -> {:ok, tenant}
+          :not_found -> resolve_subdomain(host)
+        end
     end
   end
 
-  # --- Internal Safeguarding Engine Functions ---
-
-  defp safeguarded?(clean_host) do
-    # Dynamically fetch optional full host wildcard or regex pattern matchers
-    # Example format: [~r/^management\..*/, ~r/.*\.internal\.zone$/]
-    ignored_patterns = Application.get_env(:router_shared, :ignored_host_patterns, [])
-
-    Enum.any?(ignored_patterns, fn pattern ->
-      String.match?(clean_host, pattern)
-    end)
+  defp resolve_custom_domain(host) do
+    case Application.get_env(:router_shared, :custom_domain_resolver) do
+      {mod, fun} -> apply(mod, fun, [host])
+      fun when is_function(fun, 1) -> fun.(host)
+      _ -> :not_found
+    end
   end
 
-  defp validate_tenant_token(tenant) do
-    # Dynamically fetch restricted tenant token patterns
-    # Example format: [~r/^admin$/, ~r/^internal-.*$/, ~r/.*-dev$/]
-    restricted_patterns = Application.get_env(:router_shared, :restricted_tenant_patterns, [])
+  defp resolve_subdomain(host) do
+    case String.split(host, ".") do
+      [tenant, _domain, _tld | _rest] when tenant != "" ->
+        if restricted_tenant?(tenant), do: :error, else: {:ok, tenant}
 
-    if Enum.any?(restricted_patterns, fn pattern -> String.match?(tenant, pattern) end) do
-      :error
-    else
-      {:ok, tenant}
+      _ ->
+        :error
     end
+  end
+
+  defp ignored_host?(host) do
+    patterns = Application.get_env(:router_shared, :ignored_host_patterns, [])
+    Enum.any?(patterns, &Regex.match?(&1, host))
+  end
+
+  defp restricted_tenant?(tenant) do
+    patterns = Application.get_env(:router_shared, :restricted_tenant_patterns, [])
+    Enum.any?(patterns, &Regex.match?(&1, tenant))
   end
 end

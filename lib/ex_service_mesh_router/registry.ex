@@ -2,30 +2,24 @@ defmodule Router.Registry do
   use GenServer
   require Logger
 
-  @moduledoc """
-  Service-level registry only (NO tenant logic).
-  Supports local boot-time discovery AND dynamic cross-node cluster registration.
-  """
+  @table :service_mesh_registry
 
   # --- Client API ---
 
-  @doc """
-  Starts the Registry GenServer.
-  """
   def start_link(opts) do
     GenServer.start_link(__MODULE__, %{}, name: opts[:name] || __MODULE__)
   end
 
   @doc """
-  Resolves a service host string (e.g., "auth.mesh.local") to an upstream network path.
+  Lock-free ETS lookup returning `{upstream_address, pid}` or `nil`.
   """
   def resolve(service_host) do
-    GenServer.call(__MODULE__, {:resolve, service_host})
+    case :ets.lookup(@table, service_host) do
+      [{^service_host, upstream_address, pid}] -> {upstream_address, pid}
+      [] -> nil
+    end
   end
 
-  @doc """
-  Public API invoked via Erlang RPC by remote nodes to announce their existence.
-  """
   def register_service(host, upstream_address) do
     GenServer.call(__MODULE__, {:register, host, upstream_address})
   end
@@ -34,19 +28,10 @@ defmodule Router.Registry do
 
   @impl true
   def init(_) do
-    # CRITICAL FOR DISTRIBUTED NODES:
-    # Traps system exit signals. Turns remote process/node crashes into a clean 
-    # local :EXIT message payload instead of cascading a crash through the gateway.
     Process.flag(:trap_exit, true)
-
-    # Trigger local umbrella application discovery asynchronously to avoid blocking boot
+    :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
     send(self(), :discover_local_services)
     {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:resolve, service_host}, _from, state) do
-    {:reply, Map.get(state, service_host), state}
   end
 
   @impl true
@@ -55,11 +40,20 @@ defmodule Router.Registry do
       "[Service Mesh Cluster] Dynamic node registration received from #{inspect(node(from_pid))}: '#{host}' -> #{upstream_address}"
     )
 
-    # Link to the calling remote process. If the remote node crashes or gets 
-    # disconnected, this gateway process will receive an internal :EXIT message.
-    Process.link(from_pid)
+    # Unlink previous worker PID if this host is being re-registered by a new process
+    case Map.get(state, host) do
+      {_old_addr, old_pid} when old_pid != self() and old_pid != from_pid ->
+        Process.unlink(old_pid)
 
-    # Store both the destination and the tracking pid of the worker node
+      _ ->
+        :ok
+    end
+
+    if from_pid != self() do
+      Process.link(from_pid)
+    end
+
+    :ets.insert(@table, {host, upstream_address, from_pid})
     updated_state = Map.put(state, host, {upstream_address, from_pid})
     {:reply, :ok, updated_state}
   end
@@ -67,6 +61,11 @@ defmodule Router.Registry do
   @impl true
   def handle_info(:discover_local_services, state) do
     local_state = fetch_local_service_mappings()
+
+    Enum.each(local_state, fn {host, {upstream_url, pid}} ->
+      :ets.insert(@table, {host, upstream_url, pid})
+    end)
+
     {:noreply, Map.merge(state, local_state)}
   end
 
@@ -78,10 +77,11 @@ defmodule Router.Registry do
       "[Service Mesh Cluster] Node #{inspect(dead_node)} disconnected or crashed (Reason: #{inspect(reason)}). Pruning broken routes..."
     )
 
-    # Prune out any host maps that were bound to the process ID that just died
     cleaned_state =
       Enum.reduce(state, %{}, fn
         {host, {upstream_address, ^pid}}, acc ->
+          :ets.delete(@table, host)
+
           Logger.info(
             "[Service Mesh Cluster] Deregistered route: '#{host}' -> #{upstream_address}"
           )
@@ -113,13 +113,12 @@ defmodule Router.Registry do
             host = Keyword.get(url_config, :host)
 
             if host do
-              upstream_url = "localhost:#{port}"
+              upstream_url = "127.0.0.1:#{port}"
 
               Logger.info(
                 "[Service Mesh Discovery] Mapping local umbrella service host '#{host}' to: #{upstream_url}"
               )
 
-              # Local umbrella apps use self() as the tracking pid since they share the same OS process context
               [{host, {upstream_url, self()}}]
             else
               []
