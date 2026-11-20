@@ -376,3 +376,73 @@ gateway_url = System.get_env("GATEWAY_URL") || "http://localhost:4000"
 end
 end
 ```
+
+## ⚖️ Multi-Node Load Balancing & Failover
+
+`Router.Registry` maintains a list of active `{upstream_address, pid}` entries per registered host in ETS rather than overwriting single entries:
+
+* **Local-First Routing:** When `NODE_IP` is set on the gateway node, incoming requests prefer an upstream running on the same host (`127.0.0.1` or `NODE_IP`) for sub-millisecond local latency.
+* **Automatic Load Balancing & Failover:** If multiple nodes register the same host (e.g., across regions or availability zones), traffic is distributed across healthy upstreams and fails over automatically if any node disconnects or crashes.
+* **Graceful Shutdown (`SIGTERM`):** `ClusterLifecycleWorker` traps exits and calls `Router.Registry.deregister_service/2` during `terminate/2`, draining routes immediately before container restarts during rolling deploys.
+
+### Edge Health Check (`/healthz`)
+
+The gateway responds directly to `GET /healthz` with `200 ok` without forwarding to downstream services, making it ready for load balancer health checks (Cloudflare Load Balancing, AWS ALB, Kubernetes readiness probes, and Docker `HEALTHCHECK`).
+
+---
+
+## ⚙️ Gateway Configuration Options
+
+Configure `ex_service_mesh_router` in `config/config.exs` (compile-time) and `config/runtime.exs` (runtime):
+
+```elixir
+# config/config.exs
+config :ex_service_mesh_router,
+  # Set to false when embedding :ex_service_mesh_router inside a downstream app
+  # solely for Router.Shared.* plugs/hooks without starting the Bandit edge listener
+  start_gateway: true,
+  # Compile-time toggle for forwarding the original Host header to upstreams (default: true)
+  preserve_host_header: true,
+  # Fallback upstream host when a custom domain resolves via :custom_domain_resolver
+  default_tenant_upstream: "app.mesh.local"
+```
+
+---
+
+## 🌐 Custom Domain Resolution (`:custom_domain_resolver`)
+
+In addition to leftmost subdomain extraction (`://yourdomain.com`), `Router.Shared.TenantResolver` supports custom apex or CNAME domains (`://clientdomain.com`) via an optional callback:
+
+```elixir
+# config/config.exs
+config :router_shared,
+  app_name: :my_app,
+  enable_ash_tenant: true,
+  enable_ecto_tenant: true,
+  ecto_repo: MyApp.Repo,
+  custom_domain_resolver: {MyApp.Tenancy.CustomDomainResolver, :resolve},
+  restricted_tenant_patterns: [
+    ~r/^(www|admin|api|media|root|health)\$/,
+    ~r/^internal-.*\$/
+  ]
+```
+
+Your resolver callback receives the normalized lowercase hostname and must return `{:ok, tenant_identifier}` or `:not_found`:
+
+```elixir
+defmodule MyApp.Tenancy.CustomDomainResolver do
+  @spec resolve(String.t()) :: {:ok, String.t()} | :not_found
+  def resolve(host) do
+    # Lookup in ETS/Nebulex cache or database
+    {:ok, "tenant_123"}
+  end
+end
+```
+
+---
+
+## 🛡️ Security & Header Sanitization
+
+* **Backplane Spoofing Protection:** `Router.Router` automatically strips `x-backplane-service` headers from any request originating outside trusted private/mesh networks (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` Tailscale/CGNAT, and `::1`) or any request arriving through an edge CDN (`cf-connecting-ip` / `x-forwarded-for`).
+* **RFC-1123 Subdomain Validation:** Extracted tenant subdomains are validated against strict DNS label rules (`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`) and trailing dots are stripped before tenant context assignment.
+* **WebSocket Host Verification:** When `connect_info: [:uri, :session]` is configured on your Phoenix LiveView socket, `Router.Shared.Hooks.TenantLiveMount` verifies that the WebSocket upgrade `Host` matches the HTTP session tenant.
