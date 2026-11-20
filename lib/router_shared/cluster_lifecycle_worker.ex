@@ -3,29 +3,28 @@ defmodule Router.Shared.ClusterLifecycleWorker do
   require Logger
 
   @retry_interval_ms 5_000
-
-  # --- Client API ---
+  @reconcile_interval_ms 15_000
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  # --- Server Callbacks ---
-
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     gateway_node =
       Keyword.get(opts, :gateway_node) ||
         Application.get_env(:router_shared, :gateway_node, Node.self())
 
-    # Watch cluster membership changes so routes re-register after any disconnect/restart
     if gateway_node != Node.self() do
       :net_kernel.monitor_nodes(true)
     end
 
     state = %{
       gateway_node: gateway_node,
-      timer_ref: nil
+      timer_ref: nil,
+      registered_route: nil
     }
 
     send(self(), :announce_to_gateway)
@@ -36,24 +35,13 @@ defmodule Router.Shared.ClusterLifecycleWorker do
   def handle_info(:announce_to_gateway, state) do
     state = cancel_retry_timer(state)
 
-    result =
-      cond do
-        state.gateway_node == Node.self() ->
-          register_locally()
+    case announce(state.gateway_node) do
+      {:ok, route} ->
+        # Periodic reconcile ensures route recovers even if Registry process restarts on gateway
+        timer_ref = Process.send_after(self(), :announce_to_gateway, @reconcile_interval_ms)
+        {:noreply, %{state | timer_ref: timer_ref, registered_route: route}}
 
-        state.gateway_node in Node.list() ->
-          register_remotely(state.gateway_node)
-
-        true ->
-          Logger.warning(
-            "[Mesh Network] Gateway node #{inspect(state.gateway_node)} is not visible. Retrying in 5s..."
-          )
-
-          :retry
-      end
-
-    case result do
-      :ok ->
+      :noop ->
         {:noreply, state}
 
       :retry ->
@@ -64,48 +52,74 @@ defmodule Router.Shared.ClusterLifecycleWorker do
 
   @impl true
   def handle_info({:nodeup, node}, %{gateway_node: node} = state) do
-    Logger.info("[Mesh Network] Gateway node #{inspect(node)} reconnected. Re-announcing route...")
+    Logger.info("[Mesh Network] Gateway node #{inspect(node)} connected. Re-announcing route...")
     send(self(), :announce_to_gateway)
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:nodedown, node}, %{gateway_node: node} = state) do
-    Logger.warning("[Mesh Network] Gateway node #{inspect(node)} disconnected. Will re-announce on reconnect.")
-    {:noreply, state}
+    Logger.warning("[Mesh Network] Gateway node #{inspect(node)} disconnected.")
+    {:noreply, %{state | registered_route: nil}}
   end
 
   @impl true
   def handle_info(_other, state), do: {:noreply, state}
 
+  @impl true
+  def terminate(_reason, %{gateway_node: gw, registered_route: {host, upstream_address}}) do
+    if gw == Node.self() do
+      if Process.whereis(Router.Registry),
+        do: Router.Registry.deregister_service(host, upstream_address)
+    else
+      :rpc.call(gw, Router.Registry, :deregister_service, [host, upstream_address], 2_000)
+    end
+
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
   # --- Internal Registration Helpers ---
+
+  defp announce(gateway_node) do
+    cond do
+      gateway_node == Node.self() ->
+        register_locally()
+
+      gateway_node in Node.list() ->
+        register_remotely(gateway_node)
+
+      true ->
+        Logger.warning(
+          "[Mesh Network] Gateway node #{inspect(gateway_node)} is not visible. Retrying in 5s..."
+        )
+
+        :retry
+    end
+  end
 
   defp register_locally do
     case fetch_endpoint_details() do
       {:ok, host, upstream_address} ->
         if Process.whereis(Router.Registry) do
-          _ = Router.Registry.register_service(host, upstream_address)
-          Logger.info("[Mesh Network] Registered local service '#{host}' -> #{upstream_address}")
-          :ok
+          :ok = Router.Registry.register_service(host, upstream_address)
+          {:ok, {host, upstream_address}}
         else
           :retry
         end
 
       :error ->
-        :ok
+        :noop
     end
   end
 
   defp register_remotely(gateway_node) do
     case fetch_endpoint_details() do
       {:ok, host, upstream_address} ->
-        case :rpc.call(gateway_node, Router.Registry, :register_service, [host, upstream_address]) do
+        case :rpc.call(gateway_node, Router.Registry, :register_service, [host, upstream_address], 5_000) do
           :ok ->
-            Logger.info(
-              "[Mesh Network] Announced route via RPC to #{inspect(gateway_node)}: '#{host}' -> #{upstream_address}"
-            )
-
-            :ok
+            {:ok, {host, upstream_address}}
 
           error ->
             Logger.error(
@@ -120,7 +134,7 @@ defmodule Router.Shared.ClusterLifecycleWorker do
           "[Mesh Network] Cannot register service: local application endpoint configuration is missing."
         )
 
-        :ok
+        :noop
     end
   end
 

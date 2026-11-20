@@ -51,11 +51,13 @@ defmodule ExServiceMeshRouter.MixProject do
     ]
   end
 
-  defp deps do
+    defp deps do
     [
       {:phoenix_live_view, "~> 1.0"},
       {:reverse_proxy_plug, "~> 3.0"},
-      {:reverse_proxy_plug_websocket, "0.2.0"},
+      {:reverse_proxy_plug_websocket, "~> 0.2.0"},
+      {:jason, "~> 1.4"},
+      {:libcluster, "~> 3.4"},
       {:gun, "~> 2.1"},
       {:req, "~> 0.5"},
       {:plug_cowboy, "~> 2.7", optional: true},
@@ -66,6 +68,7 @@ defmodule ExServiceMeshRouter.MixProject do
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end
+
 
   defp aliases do
     [

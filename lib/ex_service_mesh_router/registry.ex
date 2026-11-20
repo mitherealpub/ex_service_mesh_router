@@ -12,16 +12,40 @@ defmodule Router.Registry do
 
   @doc """
   Lock-free ETS lookup returning `{upstream_address, pid}` or `nil`.
+  Prefers local node upstreams when available; otherwise load-balances across healthy peers.
   """
   def resolve(service_host) do
     case :ets.lookup(@table, service_host) do
-      [{^service_host, upstream_address, pid}] -> {upstream_address, pid}
-      [] -> nil
+      [{^service_host, []}] ->
+        nil
+
+      [{^service_host, [single]}] ->
+        single
+
+      [{^service_host, upstreams}] when is_list(upstreams) ->
+        select_upstream(upstreams)
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc """
+  Returns all registered upstreams for `service_host` (useful for health/admin inspection).
+  """
+  def list_upstreams(service_host) do
+    case :ets.lookup(@table, service_host) do
+      [{^service_host, upstreams}] -> upstreams
+      [] -> []
     end
   end
 
   def register_service(host, upstream_address) do
     GenServer.call(__MODULE__, {:register, host, upstream_address})
+  end
+
+  def deregister_service(host, upstream_address) do
+    GenServer.call(__MODULE__, {:deregister, host, upstream_address})
   end
 
   # --- Server Callbacks ---
@@ -36,37 +60,66 @@ defmodule Router.Registry do
 
   @impl true
   def handle_call({:register, host, upstream_address}, {from_pid, _}, state) do
-    Logger.info(
-      "[Service Mesh Cluster] Dynamic node registration received from #{inspect(node(from_pid))}: '#{host}' -> #{upstream_address}"
-    )
+    existing = Map.get(state, host, [])
 
-    # Unlink previous worker PID if this host is being re-registered by a new process
-    case Map.get(state, host) do
-      {_old_addr, old_pid} when old_pid != self() and old_pid != from_pid ->
+    # Replace any stale entry with the same upstream_address or from_pid
+    {stale, kept} =
+      Enum.split_with(existing, fn {addr, pid} ->
+        addr == upstream_address or pid == from_pid
+      end)
+
+    Enum.each(stale, fn {_addr, old_pid} ->
+      if old_pid != self() and old_pid != from_pid do
         Process.unlink(old_pid)
-
-      _ ->
-        :ok
-    end
+      end
+    end)
 
     if from_pid != self() do
       Process.link(from_pid)
     end
 
-    :ets.insert(@table, {host, upstream_address, from_pid})
-    updated_state = Map.put(state, host, {upstream_address, from_pid})
-    {:reply, :ok, updated_state}
+    updated_upstreams = [{upstream_address, from_pid} | kept]
+    :ets.insert(@table, {host, updated_upstreams})
+
+    Logger.info(
+      "[Service Mesh Cluster] Registered '#{host}' -> #{upstream_address} from #{inspect(node(from_pid))} (pool size: #{length(updated_upstreams)})"
+    )
+
+    {:reply, :ok, Map.put(state, host, updated_upstreams)}
+  end
+
+  @impl true
+  def handle_call({:deregister, host, upstream_address}, {from_pid, _}, state) do
+    existing = Map.get(state, host, [])
+
+    updated_upstreams =
+      Enum.reject(existing, fn {addr, pid} ->
+        addr == upstream_address and pid == from_pid
+      end)
+
+    if from_pid != self() and not pid_referenced_anywhere?(state, host, from_pid) do
+      Process.unlink(from_pid)
+    end
+
+    sync_ets(host, updated_upstreams)
+    Logger.info("[Service Mesh Cluster] Gracefully deregistered '#{host}' -> #{upstream_address}")
+
+    {:reply, :ok, put_or_delete(state, host, updated_upstreams)}
   end
 
   @impl true
   def handle_info(:discover_local_services, state) do
     local_state = fetch_local_service_mappings()
 
-    Enum.each(local_state, fn {host, {upstream_url, pid}} ->
-      :ets.insert(@table, {host, upstream_url, pid})
-    end)
+    merged_state =
+      Enum.reduce(local_state, state, fn {host, new_upstreams}, acc ->
+        existing = Map.get(acc, host, [])
+        combined = Enum.uniq_by(new_upstreams ++ existing, fn {addr, _pid} -> addr end)
+        :ets.insert(@table, {host, combined})
+        Map.put(acc, host, combined)
+      end)
 
-    {:noreply, Map.merge(state, local_state)}
+    {:noreply, merged_state}
   end
 
   @impl true
@@ -74,28 +127,50 @@ defmodule Router.Registry do
     dead_node = node(pid)
 
     Logger.warning(
-      "[Service Mesh Cluster] Node #{inspect(dead_node)} disconnected or crashed (Reason: #{inspect(reason)}). Pruning broken routes..."
+      "[Service Mesh Cluster] Worker on #{inspect(dead_node)} exited (#{inspect(reason)}). Pruning routes..."
     )
 
     cleaned_state =
-      Enum.reduce(state, %{}, fn
-        {host, {upstream_address, ^pid}}, acc ->
-          :ets.delete(@table, host)
+      Enum.reduce(state, %{}, fn {host, upstreams}, acc ->
+        {pruned, remaining} = Enum.split_with(upstreams, fn {_addr, p} -> p == pid end)
 
-          Logger.info(
-            "[Service Mesh Cluster] Deregistered route: '#{host}' -> #{upstream_address}"
-          )
+        Enum.each(pruned, fn {addr, _} ->
+          Logger.info("[Service Mesh Cluster] Deregistered dead route: '#{host}' -> #{addr}")
+        end)
 
-          acc
-
-        {host, val}, acc ->
-          Map.put(acc, host, val)
+        sync_ets(host, remaining)
+        put_or_delete(acc, host, remaining)
       end)
 
     {:noreply, cleaned_state}
   end
 
-  # --- Internal Discovery Loops ---
+  # --- Internal Helpers ---
+
+  defp select_upstream(upstreams) do
+    local_ip = System.get_env("NODE_IP") || "127.0.0.1"
+
+    local_matches =
+      Enum.filter(upstreams, fn {addr, _pid} ->
+        String.starts_with?(addr, "127.0.0.1:") or String.starts_with?(addr, "#{local_ip}:")
+      end)
+
+    pool = if local_matches != [], do: local_matches, else: upstreams
+    Enum.at(pool, :erlang.phash2(self(), length(pool)))
+  end
+
+  defp sync_ets(host, []), do: :ets.delete(@table, host)
+  defp sync_ets(host, upstreams), do: :ets.insert(@table, {host, upstreams})
+
+  defp put_or_delete(map, key, []), do: Map.delete(map, key)
+  defp put_or_delete(map, key, val), do: Map.put(map, key, val)
+
+  defp pid_referenced_anywhere?(state, skip_host, target_pid) do
+    Enum.any?(state, fn
+      {^skip_host, _} -> false
+      {_host, upstreams} -> Enum.any?(upstreams, fn {_addr, pid} -> pid == target_pid end)
+    end)
+  end
 
   defp fetch_local_service_mappings do
     Application.loaded_applications()
@@ -108,18 +183,11 @@ defmodule Router.Registry do
           if Code.ensure_loaded?(endpoint_module) do
             http_config = endpoint_module.config(:http) || []
             port = Keyword.get(http_config, :port) || 4000
-
             url_config = endpoint_module.config(:url) || []
             host = Keyword.get(url_config, :host)
 
             if host do
-              upstream_url = "127.0.0.1:#{port}"
-
-              Logger.info(
-                "[Service Mesh Discovery] Mapping local umbrella service host '#{host}' to: #{upstream_url}"
-              )
-
-              [{host, {upstream_url, self()}}]
+              [{host, [{"127.0.0.1:#{port}", self()}]}]
             else
               []
             end
